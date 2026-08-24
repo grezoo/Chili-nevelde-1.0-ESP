@@ -1,0 +1,733 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DHT.h>
+#include <EEPROM.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+// --- WiFi SSID/Jelszó ---
+const char* ssid = "123456";
+const char* password = "123456";
+
+// --- Adafruit IO hitelesítés ---
+#define IO_USERNAME  "123456"
+#define IO_KEY       "123456"
+
+// --- MQTT szerver ---
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, IO_USERNAME, IO_KEY);
+
+// --- Feedek ---
+Adafruit_MQTT_Publish feedTemp  = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/temp");
+Adafruit_MQTT_Publish feedHum   = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/hum");
+Adafruit_MQTT_Publish feedMoist = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/moist");
+Adafruit_MQTT_Publish feedLight = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/light");
+
+// --- Szenzor lábak ---
+#define DHTPIN   D1
+#define DHTTYPE  DHT22
+#define LIGHTPIN D2
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- Kimenetek ---
+#define PUMP_PIN D6
+#define FAN_PIN  D7
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// --- Állapotok ---
+bool autoMode   = false;
+bool pumpState  = LOW;
+bool fanState   = LOW;
+
+unsigned long lastSensorCheck = 0;
+const unsigned long sensorInterval = 30000;
+float temp = NAN;
+float hum  = NAN;
+unsigned long pumpStart = 0;
+
+// --- Nyelv ---
+enum Lang : uint8_t { HU = 0, EN = 1 };
+
+// --- Beállítások EEPROM ---
+struct Settings {
+  uint16_t magic;
+  int   moistureThreshold;
+  float tempThresholdC;
+  int   pumpMaxSeconds;
+  int   humThreshold;
+  bool  autoMode;
+  float tempOffset;
+  float humOffset;
+  int   moistOffset;
+  int   moistDry;
+  int   moistWet;
+  uint8_t ip[4];
+  uint8_t gw[4];
+  uint8_t sn[4];
+  uint8_t lang;
+};
+Settings cfg;
+const size_t EEPROM_SIZE = sizeof(Settings);
+
+// --- Webserver ---
+ESP8266WebServer server(80);
+
+// --- Fordítások (rövidített) ---
+String t(const String& key) {
+  bool hu = (cfg.lang == HU);
+  if (key == "title") return hu ? "Chili Nevelde 1.0" : "Chili Nursery 1.0";
+  if (key == "auto_btn") return hu ? "AUTOMATA" : "AUTO";
+  if (key == "manual_btn") return hu ? "MANUÁLIS" : "MANUAL";
+  if (key == "auto_badge") return hu ? "AUTOMATA MÓD" : "AUTO MODE";
+  if (key == "manual_badge") return hu ? "MANUÁLIS MÓD" : "MANUAL MODE";
+  if (key == "pump_btn") return hu ? "PUMPA " : "PUMP ";
+  if (key == "fan_btn") return hu ? "VENTI " : "FAN ";
+  if (key == "settings_title") return hu ? "Beállítások" : "Settings";
+  if (key == "login_btn_menu") return hu ? "Belépés" : "Login";
+  if (key == "help_btn_menu") return hu ? "Használati útmutató" : "User guide";
+  if (key == "reset_btn") return hu ? "Reset" : "Reset";
+  if (key == "light_bright") return hu ? "Fény: Világos" : "Light: Bright";
+  if (key == "light_dark") return hu ? "Fény: Sötét" : "Light: Dark";
+  if (key == "no_perm") return hu ? "Nincs jogod!" : "No permission!";
+  return key;
+}
+
+// --- Mobilbarát, dark mód CSS (flashből) ---
+String mobileCSS() {
+  return String(F(
+    "<style>"
+    "*{box-sizing:border-box}"
+    "body{font-family:system-ui,sans-serif;text-align:center;background:#121212;color:#E0E0E0;margin:0;padding:20px}"
+    "h1{font-size:36px;margin:20px;color:#FFF}"
+    "button{width:90%;max-width:500px;height:120px;font-size:48px;margin:20px auto;display:block;border:none;border-radius:16px;background:#2979FF;color:#FFF;cursor:pointer}"
+    ".danger{background:#D32F2F}"
+    ".row{display:flex;justify-content:center;gap:20px;margin:20px}"
+    ".row button{flex:1}"
+    ".mode-badge{display:inline-block;padding:20px 40px;font-size:42px;border-radius:20px;margin:20px auto;color:#fff}"
+    ".auto{background:#388E3C}"
+    ".manual{background:#D32F2F}"
+    ".gauge-container{display:inline-block;margin:20px}"
+    "#lightBulb{font-size:80px;display:block}"
+    "#lightBulb.on{color:#FFD600}"
+    "#lightBulb.off{color:#555}"
+    "#lightText{font-size:28px;margin-top:10px}"
+    "label{font-size:28px;display:block;margin-top:20px;color:#E0E0E0}"
+    "select,input[type=number],input[type=password],input[type=text]{width:90%;max-width:500px;height:100px;font-size:40px;text-align:center;margin:10px auto;border:2px solid #555;border-radius:12px;background:#1E1E1E;color:#FFF;display:block}"
+    ".link{font-size:28px;display:block;margin-top:20px;color:#90CAF9}"
+    "a{text-decoration:none;color:inherit}"
+    "</style>"
+  ));
+}
+
+// --- HTML helper: gomb hozzáadása ---
+void addButton(String &html, const char* url, const String &label, bool danger=false) {
+  html += F("<a href='");
+  html += url;
+  html += F("'><button");
+  if (danger) html += F(" class='danger'");
+  html += F(">");
+  html += label;
+  html += F("</button></a>");
+}
+
+// --- EEPROM betöltés/mentés ---
+void setDefaultsIP() {
+  cfg.ip[0]=192; cfg.ip[1]=168; cfg.ip[2]=1; cfg.ip[3]=50;
+  cfg.gw[0]=192; cfg.gw[1]=168; cfg.gw[2]=1; cfg.gw[3]=1;
+  cfg.sn[0]=255; cfg.sn[1]=255; cfg.sn[2]=255; cfg.sn[3]=0;
+}
+void loadSettings() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(0, cfg);
+  if (cfg.magic != 0xBEEF) {
+    cfg.magic = 0xBEEF;
+    cfg.moistureThreshold = 400;
+    cfg.tempThresholdC    = 28.0;
+    cfg.pumpMaxSeconds    = 30;
+    cfg.humThreshold      = 70;
+    cfg.autoMode          = false;
+    cfg.tempOffset        = 0.0;
+    cfg.humOffset         = 0.0;
+    cfg.moistOffset       = 0;
+    cfg.moistDry          = 700;
+    cfg.moistWet          = 300;
+    setDefaultsIP();
+    cfg.lang = HU;
+    EEPROM.put(0, cfg);
+    EEPROM.commit();
+  }
+  // Ha 0.0.0.0 lenne, visszaállítjuk
+  bool invalidIP = (cfg.ip[0]==0 && cfg.ip[1]==0 && cfg.ip[2]==0 && cfg.ip[3]==0);
+  if (invalidIP) { setDefaultsIP(); EEPROM.put(0,cfg); EEPROM.commit(); }
+  autoMode = cfg.autoMode;
+}
+void saveSettings() {
+  cfg.autoMode = autoMode;
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+// --- MQTT reconnect ---
+void MQTT_connect() {
+  int8_t ret;
+  if (mqtt.connected()) return;
+  Serial.print(F("Csatlakozás az Adafruit IO-hoz... "));
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) {
+    Serial.println(mqtt.connectErrorString(ret));
+    Serial.println(F("Újrapróbálkozás 5 mp múlva..."));
+    mqtt.disconnect();
+    delay(5000);
+    if (--retries == 0) {
+      ESP.restart();
+    }
+  }
+  Serial.println(F("MQTT kapcsolat létrejött!"));
+}
+
+// --- Login (egyszerű) ---
+bool authenticated = false;
+const String adminPass = "0331";
+void handleLogin() {
+  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+  html += (cfg.lang==HU ? "Belépés" : "Login");
+  html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  html += mobileCSS();
+  html += F("</head><body><h1>");
+  html += t("title");
+  html += F(" – ");
+  html += (cfg.lang==HU ? "Belépés" : "Login");
+  html += F("</h1><form action='/dologin' method='post'><label>");
+  html += (cfg.lang==HU ? "Jelszó:" : "Password:");
+  html += F("</label><input type='password' name='pass'><button type='submit'>");
+  html += (cfg.lang==HU ? "BELÉPÉS" : "SIGN IN");
+  html += F("</button></form><a class='link' href='/'>");
+  html += t("settings_title");
+  html += F("</a></body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+void handleDoLogin() {
+  if (server.hasArg("pass") && server.arg("pass") == adminPass) {
+    authenticated = true;
+    server.sendHeader("Location", "/");
+    server.send(303);
+  } else {
+    server.send(200, "text/plain; charset=utf-8", (cfg.lang==HU ? "Hibás jelszó!" : "Wrong password!"));
+  }
+}
+
+// --- Használati útmutató (részletes) ---
+void handleHelp() {
+  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+  html += (cfg.lang==HU ? "Használati útmutató" : "User guide");
+  html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  html += mobileCSS();
+  html += F("</head><body><h1>");
+  html += (cfg.lang==HU ? "Használati útmutató" : "User guide");
+  html += F("</h1>");
+
+  if (cfg.lang == HU) {
+    html += F("<h2>Webes lehetőségek</h2><ul style='text-align:left; font-size:24px;'>");
+    html += F("<li>Főoldal: állapot kijelzés</li><li>Automata/Manuál váltás</li><li>Manuál módban Pumpa/Venti gombok</li>");
+    html += F("<li>Beállítások: küszöbök, kalibráció, IP, nyelv</li><li>Belépés jelszóval, Reset</li></ul>");
+    html += F("<h2>Soros parancsok</h2><ul style='text-align:left; font-size:24px;'>");
+    html += F("<li>P1/P0 – Pumpa BE/KI</li><li>F1/F0 – Venti BE/KI</li><li>AM/MM – Automata/Manuál</li>");
+    html += F("<li>MTxxx / TDxx.x / HMxx / PMxxx – küszöbök</li><li>OD±x.x / OH±x.x / OM±xxx – offsetek</li>");
+    html += F("<li>DRxxx / WTxxx – zónák</li><li>IP/GW/SN – IP beállítás</li><li>LGHU / LGEN – nyelv</li></ul>");
+    html += F("<h2>MQTT (Adafruit IO)</h2><p>Temp/Hum/Moist/Light feedek percenként frissülnek.</p>");
+  } else {
+    html += F("<h2>Web options</h2><ul style='text-align:left; font-size:24px;'>");
+    html += F("<li>Main page: status</li><li>Auto/Manual toggle</li><li>Manual: Pump/Fan buttons</li>");
+    html += F("<li>Settings: thresholds, calibration, IP, language</li><li>Password login, Reset</li></ul>");
+    html += F("<h2>Serial commands</h2><ul style='text-align:left; font-size:24px;'>");
+    html += F("<li>P1/P0 – Pump ON/OFF</li><li>F1/F0 – Fan ON/OFF</li><li>AM/MM – Auto/Manual</li>");
+    html += F("<li>MTxxx / TDxx.x / HMxx / PMxxx – thresholds</li><li>OD±x.x / OH±x.x / OM±xxx – offsets</li>");
+    html += F("<li>DRxxx / WTxxx – zones</li><li>IP/GW/SN – IP config</li><li>LGHU / LGEN – language</li></ul>");
+    html += F("<h2>MQTT (Adafruit IO)</h2><p>Temp/Hum/Moist/Light feeds updated every minute.</p>");
+  }
+
+  html += F("<a class='link' href='/'>");
+  html += t("title");
+  html += F("</a></body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// --- Beállítások oldal ---
+void handleSettings() {
+  if (!authenticated) {
+    String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+    html += t("no_perm");
+    html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+    html += mobileCSS();
+    html += F("</head><body><h1>");
+    html += t("no_perm");
+    html += F("</h1><a class='link' href='/login'>");
+    html += t("login_btn_menu");
+    html += F("</a></body></html>");
+    server.send(403, "text/html; charset=utf-8", html);
+    return;
+  }
+
+  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+  html += t("settings_title");
+  html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  html += mobileCSS();
+  html += F("</head><body><h1>");
+  html += t("settings_title");
+  html += F("</h1><form action='/save' method='post'>");
+
+  auto addNumber = [&](const char* name, const String& label, const String& val, const char* attrs="") {
+    html += F("<label>");
+    html += label;
+    html += F("</label><input type='number' name='");
+    html += name;
+    html += F("' ");
+    html += attrs;
+    html += F(" value='");
+    html += val;
+    html += F("'>");
+  };
+
+  addNumber("moist", (cfg.lang==HU ? "Talajnedvesség küszöb" : "Soil moisture threshold"), String(cfg.moistureThreshold), "min='0' max='1023'");
+  addNumber("temp",  (cfg.lang==HU ? "Hőmérséklet küszöb (°C)" : "Temperature threshold (°C)"),  String(cfg.tempThresholdC,1), "step='0.1'");
+  addNumber("pump",  (cfg.lang==HU ? "Pumpa max idő (mp)" : "Pump max time (s)"), String(cfg.pumpMaxSeconds), "min='5' max='600'");
+  addNumber("hum",   (cfg.lang==HU ? "Páratartalom küszöb (%)" : "Humidity threshold (%)"), String(cfg.humThreshold), "min='0' max='100'");
+
+  addNumber("moistDry", (cfg.lang==HU ? "Száraz küszöb" : "Dry threshold"), String(cfg.moistDry), "min='0' max='1023'");
+  addNumber("moistWet", (cfg.lang==HU ? "Nedves küszöb" : "Wet threshold"), String(cfg.moistWet), "min='0' max='1023'");
+
+  addNumber("tempOffset", (cfg.lang==HU ? "Hőmérséklet offset (°C)" : "Temperature offset (°C)"), String(cfg.tempOffset,1), "step='0.1'");
+  addNumber("humOffset",  (cfg.lang==HU ? "Páratartalom offset (%)" : "Humidity offset (%)"), String(cfg.humOffset,1), "step='0.1'");
+  addNumber("moistOffset",(cfg.lang==HU ? "Talajnedvesség offset (ADC)" : "Soil moisture offset (ADC)"), String(cfg.moistOffset), "");
+
+  // IP
+  html += F("<label>IP:</label><input type='text' name='ip' value='");
+  html += String(cfg.ip[0]) + "." + String(cfg.ip[1]) + "." + String(cfg.ip[2]) + "." + String(cfg.ip[3]);
+  html += F("'>");
+
+  html += F("<label>Gateway:</label><input type='text' name='gw' value='");
+  html += String(cfg.gw[0]) + "." + String(cfg.gw[1]) + "." + String(cfg.gw[2]) + "." + String(cfg.gw[3]);
+  html += F("'>");
+
+  html += F("<label>Subnet:</label><input type='text' name='sn' value='");
+  html += String(cfg.sn[0]) + "." + String(cfg.sn[1]) + "." + String(cfg.sn[2]) + "." + String(cfg.sn[3]);
+  html += F("'>");
+
+  // Nyelv
+  html += F("<label>Nyelv / Language:</label><select name='lang'>");
+  html += String(F("<option value='0' ")) + (cfg.lang==HU ? "selected" : "") + F(">Magyar</option>");
+  html += String(F("<option value='1' ")) + (cfg.lang==EN ? "selected" : "") + F(">English</option>");
+  html += F("</select>");
+
+  html += F("<button type='submit'>MENTÉS / SAVE</button></form><a class='link' href='/'>");
+  html += t("title");
+  html += F("</a></body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// --- Mentés és restart ---
+void handleSave() {
+  if (!authenticated) {
+    server.send(403, "text/plain; charset=utf-8", t("no_perm"));
+    return;
+  }
+  if (server.hasArg("moist")) cfg.moistureThreshold = constrain(server.arg("moist").toInt(), 0, 1023);
+  if (server.hasArg("temp"))  cfg.tempThresholdC    = server.arg("temp").toFloat();
+  if (server.hasArg("pump"))  cfg.pumpMaxSeconds    = constrain(server.arg("pump").toInt(), 5, 600);
+  if (server.hasArg("hum"))   cfg.humThreshold      = constrain(server.arg("hum").toInt(), 0, 100);
+  if (server.hasArg("moistDry")) cfg.moistDry = constrain(server.arg("moistDry").toInt(), 0, 1023);
+  if (server.hasArg("moistWet")) cfg.moistWet = constrain(server.arg("moistWet").toInt(), 0, 1023);
+  if (cfg.moistWet > cfg.moistDry) {
+    int mid = (cfg.moistWet + cfg.moistDry) / 2;
+    cfg.moistWet = max(0, mid - 10);
+    cfg.moistDry = min(1023, mid + 10);
+  }
+  if (server.hasArg("tempOffset")) cfg.tempOffset = server.arg("tempOffset").toFloat();
+  if (server.hasArg("humOffset"))  cfg.humOffset  = server.arg("humOffset").toFloat();
+  if (server.hasArg("moistOffset")) cfg.moistOffset = server.arg("moistOffset").toInt();
+  if (server.hasArg("ip")) sscanf(server.arg("ip").c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.ip[0], &cfg.ip[1], &cfg.ip[2], &cfg.ip[3]);
+  if (server.hasArg("gw")) sscanf(server.arg("gw").c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.gw[0], &cfg.gw[1], &cfg.gw[2], &cfg.gw[3]);
+  if (server.hasArg("sn")) sscanf(server.arg("sn").c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.sn[0], &cfg.sn[1], &cfg.sn[2], &cfg.sn[3]);
+  if (server.hasArg("lang")) cfg.lang = (uint8_t) constrain(server.arg("lang").toInt(), 0, 1);
+
+  saveSettings();
+
+  server.send(200, "text/plain; charset=utf-8", "Mentve. Újraindítás...");
+  delay(300);
+  ESP.restart();
+}
+
+// --- Főoldal ---
+void handleRoot() {
+  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+  html += t("title");
+  html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  html += F("<script src='https://cdn.jsdelivr.net/npm/canvas-gauges/gauge.min.js'></script>");
+  html += mobileCSS();
+  html += F("</head><body><h1>");
+  html += t("title");
+  html += F("</h1>");
+
+  html += String(F("<div class='mode-badge ")) + (autoMode ? "auto" : "manual") + F("'>");
+  html += (autoMode ? t("auto_badge") : t("manual_badge"));
+  html += F("</div>");
+
+  addButton(html, "/auto", t("auto_btn"));
+  addButton(html, "/manual", t("manual_btn"), true);
+
+  if (!autoMode) {
+    html += F("<div class='row'>");
+    addButton(html, "/pumptoggle", t("pump_btn") + String(pumpState ? (cfg.lang==HU ? "KI" : "OFF") : (cfg.lang==HU ? "BE" : "ON")));
+    addButton(html, "/fantoggle", t("fan_btn") + String(fanState ? (cfg.lang==HU ? "KI" : "OFF") : (cfg.lang==HU ? "BE" : "ON")));
+    html += F("</div>");
+  }
+
+  addButton(html, "/settings", t("settings_title"));
+  addButton(html, "/login", t("login_btn_menu"));
+  addButton(html, "/help", t("help_btn_menu"));
+  addButton(html, "/reset", t("reset_btn"), true);
+
+  html += F("<div class='gauge-container'><canvas id='tempGauge'></canvas></div>");
+  html += F("<div class='gauge-container'><canvas id='humGauge'></canvas></div>");
+  html += F("<div class='gauge-container'><canvas id='moistGauge'></canvas></div>");
+
+  html += F("<div class='gauge-container' style='display:block; margin-top:10px;'>");
+  html += F("<div id='lightBulb' class='off'>💡</div><div id='lightText'>?</div></div>");
+
+  // Gauge JS
+  html += F("<script>");
+  html += F("var tempGauge=new RadialGauge({renderTo:'tempGauge',width:250,height:250,units:'°C',");
+  html += String(F("title:'")) + (cfg.lang==HU ? "Hőmérséklet" : "Temperature") + F("',");
+  html += F("minValue:0,maxValue:50,majorTicks:['0','10','20','30','40','50'],minorTicks:2,valueBox:true}).draw();");
+
+  html += F("var humGauge=new RadialGauge({renderTo:'humGauge',width:250,height:250,units:'%',");
+  html += String(F("title:'")) + (cfg.lang==HU ? "Páratartalom" : "Humidity") + F("',");
+  html += F("minValue:0,maxValue:100,majorTicks:['0','20','40','60','80','100'],minorTicks:2,valueBox:true}).draw();");
+
+  html += F("var moistGauge=new LinearGauge({renderTo:'moistGauge',width:300,height:150,");
+  html += String(F("title:'")) + (cfg.lang==HU ? "Talajnedvesség" : "Soil moisture") + F("',");
+  html += F("minValue:0,maxValue:1023,majorTicks:['0','200','400','600','800','1023'],minorTicks:10,valueBox:true,highlights:[");
+  html += String(F("{ from:0, to:")) + String(cfg.moistWet) + F(", color:'rgba(50,50,200,.75)' },");
+  html += String(F("{ from:")) + String(cfg.moistWet) + F(", to:") + String(cfg.moistDry) + F(", color:'rgba(50,200,50,.75)' },");
+  html += String(F("{ from:")) + String(cfg.moistDry) + F(", to:1023, color:'rgba(200,50,50,.75)' }");
+  html += F("]}).draw();");
+
+  html += F("function updateGauges(){fetch('/data').then(r=>r.json()).then(d=>{");
+  html += F("tempGauge.value=d.temp;humGauge.value=d.hum;moistGauge.value=d.moist;");
+  html += F("var bulb=document.getElementById('lightBulb');var txt=document.getElementById('lightText');");
+  html += String(F("if(d.light){bulb.className='on';txt.innerText='")) + (cfg.lang==HU ? "Fény: Világos" : "Light: Bright") + F("';}else{");
+  html += String(F("bulb.className='off';txt.innerText='")) + (cfg.lang==HU ? "Fény: Sötét" : "Light: Dark") + F("';}");
+  html += F("});}");
+  html += F("setInterval(updateGauges,5000);updateGauges();");
+  html += F("</script>");
+
+  html += F("</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// --- JSON adat endpoint ---
+void handleData() {
+  int moistRaw = analogRead(A0);
+  int moistCal = moistRaw + cfg.moistOffset;
+  moistCal = constrain(moistCal, 0, 1023);
+  int lightRaw = digitalRead(LIGHTPIN);
+  int light = (lightRaw == LOW) ? 1 : 0;
+  float tCal = (isnan(temp) ? 0 : temp) + cfg.tempOffset;
+  float hCal = (isnan(hum) ? 0 : hum) + cfg.humOffset;
+
+  String json = F("{");
+  json += "\"temp\":"  + String(tCal,1) + ",";
+  json += "\"hum\":"   + String(hCal,0) + ",";
+  json += "\"moist\":" + String(moistCal) + ",";
+  json += "\"light\":" + String(light);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// --- Módváltások és kapcsolgatások ---
+void handleAuto()   { autoMode = true;  saveSettings(); server.sendHeader("Location", "/"); server.send(303); }
+void handleManual() { autoMode = false; saveSettings(); server.sendHeader("Location", "/"); server.send(303); }
+void handlePumpToggle() {
+  if (!autoMode) {
+    if (!pumpState) { pumpState = true; pumpStart = millis(); digitalWrite(PUMP_PIN, RELAY_ON); }
+    else { pumpState = false; digitalWrite(PUMP_PIN, RELAY_OFF); }
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+void handleFanToggle() {
+  if (!autoMode) {
+    fanState = !fanState; digitalWrite(FAN_PIN, fanState ? RELAY_ON : RELAY_OFF);
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+void handleReset() {
+  if (!authenticated) {
+    String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>");
+    html += t("no_perm");
+    html += F("</title><meta name='viewport' content='width=device-width, initial-scale=1'>");
+    html += mobileCSS();
+    html += F("</head><body><h1>");
+    html += t("no_perm");
+    html += F("</h1><a class='link' href='/login'>");
+    html += t("login_btn_menu");
+    html += F("</a></body></html>");
+    server.send(403, "text/html; charset=utf-8", html);
+    return;
+  }
+  server.send(200, "text/plain; charset=utf-8", "Újraindítás...");
+  delay(200);
+  ESP.restart();
+}
+
+// --- Soros parancsok: switch–case ---
+void handleSerialCommand(const String &cmd) {
+  if (cmd.length() == 0) return;
+  switch (cmd[0]) {
+    case 'P':
+      if (cmd == "P1") { pumpState = true; pumpStart = millis(); digitalWrite(PUMP_PIN, RELAY_ON); Serial.println(F("Pumpa BE")); }
+      else if (cmd == "P0") { pumpState = false; digitalWrite(PUMP_PIN, RELAY_OFF); Serial.println(F("Pumpa KI")); }
+      else if (cmd.startsWith("PM")) { cfg.pumpMaxSeconds = constrain(cmd.substring(2).toInt(), 5, 600); saveSettings(); Serial.printf("PumpMaxSeconds=%d\n", cfg.pumpMaxSeconds); }
+      else Serial.println(F("Ismeretlen P parancs"));
+      break;
+    case 'F':
+      if (cmd == "F1") { fanState = true; digitalWrite(FAN_PIN, RELAY_ON); Serial.println(F("Venti BE")); }
+      else if (cmd == "F0") { fanState = false; digitalWrite(FAN_PIN, RELAY_OFF); Serial.println(F("Venti KI")); }
+      else Serial.println(F("Ismeretlen F parancs"));
+      break;
+    case 'A':
+      if (cmd == "AM") { autoMode = true; saveSettings(); Serial.println(F("Automata mód")); }
+      else Serial.println(F("Ismeretlen A parancs"));
+      break;
+    case 'M':
+      if (cmd == "MM") { autoMode = false; saveSettings(); Serial.println(F("Manuál mód")); }
+      else if (cmd.startsWith("MT")) { cfg.moistureThreshold = constrain(cmd.substring(2).toInt(),0,1023); saveSettings(); Serial.printf("MoistureThreshold=%d\n", cfg.moistureThreshold); }
+      else Serial.println(F("Ismeretlen M parancs"));
+      break;
+    case 'T':
+      if (cmd.startsWith("TD")) { cfg.tempThresholdC = cmd.substring(2).toFloat(); saveSettings(); Serial.printf("TempThreshold=%.1f\n", cfg.tempThresholdC); }
+      else Serial.println(F("Ismeretlen T parancs"));
+      break;
+    case 'H':
+      if (cmd.startsWith("HM")) { cfg.humThreshold = constrain(cmd.substring(2).toInt(),0,100); saveSettings(); Serial.printf("HumThreshold=%d\n", cfg.humThreshold); }
+      else if (cmd.startsWith("OH")) { cfg.humOffset = cmd.substring(2).toFloat(); saveSettings(); Serial.printf("HumOffset=%.1f\n", cfg.humOffset); }
+      else Serial.println(F("Ismeretlen H parancs"));
+      break;
+    case 'O':
+      if (cmd.startsWith("OD")) { cfg.tempOffset = cmd.substring(2).toFloat(); saveSettings(); Serial.printf("TempOffset=%.1f\n", cfg.tempOffset); }
+      else if (cmd.startsWith("OM")) { cfg.moistOffset = cmd.substring(2).toInt(); saveSettings(); Serial.printf("MoistOffset=%d\n", cfg.moistOffset); }
+      else Serial.println(F("Ismeretlen O parancs"));
+      break;
+    case 'D':
+      if (cmd.startsWith("DR")) { cfg.moistDry = constrain(cmd.substring(2).toInt(),0,1023); saveSettings(); Serial.printf("Dry=%d\n", cfg.moistDry); }
+      else Serial.println(F("Ismeretlen D parancs"));
+      break;
+    case 'W':
+      if (cmd.startsWith("WT")) { cfg.moistWet = constrain(cmd.substring(2).toInt(),0,1023); saveSettings(); Serial.printf("Wet=%d\n", cfg.moistWet); }
+      else Serial.println(F("Ismeretlen W parancs"));
+      break;
+    case 'I':
+      if (cmd.startsWith("IP")) {
+        sscanf(cmd.substring(2).c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.ip[0], &cfg.ip[1], &cfg.ip[2], &cfg.ip[3]);
+        saveSettings();
+        Serial.printf("IP: %d.%d.%d.%d\n", cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
+        Serial.println(F("Újraindítás az új IP-vel..."));
+        delay(300);
+        ESP.restart();
+      } else Serial.println(F("Ismeretlen I parancs"));
+      break;
+    case 'G':
+      if (cmd.startsWith("GW")) {
+        sscanf(cmd.substring(2).c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.gw[0], &cfg.gw[1], &cfg.gw[2], &cfg.gw[3]);
+        saveSettings();
+        Serial.printf("Gateway: %d.%d.%d.%d\n", cfg.gw[0], cfg.gw[1], cfg.gw[2], cfg.gw[3]);
+      } else Serial.println(F("Ismeretlen G parancs"));
+      break;
+    case 'S':
+      if (cmd.startsWith("SN")) {
+        sscanf(cmd.substring(2).c_str(), "%hhu.%hhu.%hhu.%hhu", &cfg.sn[0], &cfg.sn[1], &cfg.sn[2], &cfg.sn[3]);
+        saveSettings();
+        Serial.printf("Subnet: %d.%d.%d.%d\n", cfg.sn[0], cfg.sn[1], cfg.sn[2], cfg.sn[3]);
+      } else Serial.println(F("Ismeretlen S parancs"));
+      break;
+    case 'L':
+      if (cmd == "LGHU") { cfg.lang = HU; saveSettings(); Serial.println(F("Nyelv: Magyar")); }
+      else if (cmd == "LGEN") { cfg.lang = EN; saveSettings(); Serial.println(F("Language: English")); }
+      else Serial.println(F("Ismeretlen L parancs"));
+      break;
+    default:
+      Serial.println(F("Ismeretlen parancs"));
+  }
+}
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, RELAY_OFF);
+  digitalWrite(FAN_PIN, RELAY_OFF);
+
+  pinMode(LIGHTPIN, INPUT);
+  dht.begin();
+
+  loadSettings();
+
+  // WiFi config
+  IPAddress ip(cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
+  IPAddress gw(cfg.gw[0], cfg.gw[1], cfg.gw[2], cfg.gw[3]);
+  IPAddress sn(cfg.sn[0], cfg.sn[1], cfg.sn[2], cfg.sn[3]);
+  IPAddress dns(8,8,8,8);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(ip, gw, sn, dns);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi kapcsolódva!");
+  Serial.print("Elérhető: http://"); Serial.println(WiFi.localIP());
+
+  // Route-ok
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/settings", handleSettings);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/auto", handleAuto);
+  server.on("/manual", handleManual);
+  server.on("/pumptoggle", handlePumpToggle);
+  server.on("/fantoggle", handleFanToggle);
+  server.on("/reset", handleReset);
+  server.on("/login", handleLogin);
+  server.on("/dologin", HTTP_POST, handleDoLogin);
+  server.on("/help", handleHelp);
+  server.begin();
+
+  // MQTT első csatlakozás
+  MQTT_connect();
+}
+
+// --- Loop ---
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  // Szenzorok olvasása 30 mp-enként
+  if (now - lastSensorCheck >= sensorInterval) {
+    lastSensorCheck = now;
+    temp = dht.readTemperature();
+    hum  = dht.readHumidity();
+
+    // Automata logika
+    if (autoMode) {
+      int moistRaw = analogRead(A0);
+      int moistCal = moistRaw + cfg.moistOffset;
+      moistCal = constrain(moistCal, 0, 1023);
+
+      float tCal = (isnan(temp) ? 0 : temp) + cfg.tempOffset;
+      float hCal = (isnan(hum) ? 0 : hum) + cfg.humOffset;
+
+      bool needPump = (moistCal > cfg.moistureThreshold);
+      if (needPump && !pumpState) {
+        pumpState = true;
+        pumpStart = now;
+        digitalWrite(PUMP_PIN, RELAY_ON);
+      }
+      bool desiredFan = (tCal > cfg.tempThresholdC) || (hCal > cfg.humThreshold);
+      if (desiredFan != fanState) {
+        fanState = desiredFan;
+        digitalWrite(FAN_PIN, fanState ? RELAY_ON : RELAY_OFF);
+      }
+    }
+  }
+
+  // Pumpa időkorlát
+  if (pumpState) {
+    bool timeExceeded = (now - pumpStart) >= (unsigned long)cfg.pumpMaxSeconds * 1000;
+    if (timeExceeded) {
+      pumpState = false;
+      digitalWrite(PUMP_PIN, RELAY_OFF);
+    }
+  }
+
+  // Soros riport percenként
+  static unsigned long lastSerialReport = 0;
+  if (millis() - lastSerialReport > 60000) {
+    lastSerialReport = millis();
+    int moistRaw = analogRead(A0);
+    int moistCal = moistRaw + cfg.moistOffset;
+    moistCal = constrain(moistCal, 0, 1023);
+    int lightRaw = digitalRead(LIGHTPIN);
+    int light = (lightRaw == LOW) ? 1 : 0;
+    float tCal = (isnan(temp) ? 0 : temp) + cfg.tempOffset;
+    float hCal = (isnan(hum) ? 0 : hum) + cfg.humOffset;
+    Serial.printf("TEMP: %.1f C, HUM: %.0f %%, MOIST: %d, LIGHT: %s, PUMP: %s, FAN: %s, MODE: %s\n",
+      tCal, hCal, moistCal, light ? "Világos" : "Sötét",
+      pumpState ? "ON" : "OFF", fanState ? "ON" : "OFF", autoMode ? "AUTO" : "MANUAL");
+  }
+
+  // Soros parancs olvasás
+  static String serialBuffer;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
+        handleSerialCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      serialBuffer += c;
+    }
+  }
+
+  // WiFi watchdog
+  static unsigned long lastWifiCheck = 0;
+  static int reconnectTries = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi kapcsolat elveszett, próbálkozás újracsatlakozással...");
+      WiFi.disconnect();
+      IPAddress ip(cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]);
+      IPAddress gw(cfg.gw[0], cfg.gw[1], cfg.gw[2], cfg.gw[3]);
+      IPAddress sn(cfg.sn[0], cfg.sn[1], cfg.sn[2], cfg.sn[3]);
+      IPAddress dns(8,8,8,8);
+      WiFi.config(ip, gw, sn, dns);
+      WiFi.begin(ssid, password);
+      reconnectTries++;
+      if (reconnectTries >= 3) {
+        Serial.println("Nem sikerült újracsatlakozni, újraindítás...");
+        ESP.restart();
+      }
+    } else {
+      reconnectTries = 0;
+    }
+  }
+
+  // MQTT keep-alive + adatküldés percenként
+  MQTT_connect();
+  mqtt.processPackets(10);
+  static unsigned long lastMqtt = 0;
+  if (millis() - lastMqtt > 60000) {
+    lastMqtt = millis();
+
+    int moistRaw = analogRead(A0);
+    int moistCal = moistRaw + cfg.moistOffset;
+    moistCal = constrain(moistCal, 0, 1023);
+    int lightRaw = digitalRead(LIGHTPIN);
+    int light = (lightRaw == LOW) ? 1 : 0;
+    float tCal = (isnan(temp) ? 0 : temp) + cfg.tempOffset;
+    float hCal = (isnan(hum) ? 0 : hum) + cfg.humOffset;
+
+    if (!feedTemp.publish(tCal))      Serial.println(F("Temp publish FAIL"));
+    if (!feedHum.publish(hCal))       Serial.println(F("Hum publish FAIL"));
+    if (!feedMoist.publish(moistCal)) Serial.println(F("Moist publish FAIL"));
+    if (!feedLight.publish(light))    Serial.println(F("Light publish FAIL"));
+    Serial.println(F("Adatok elküldve az Adafruit IO-ra."));
+  }
+
+  yield();
+}
+// KÓD VÉGE
