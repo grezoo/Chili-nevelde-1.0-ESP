@@ -86,4 +86,6 @@ VCC / 3.3V / 5V
 NodeMCU / D1
 Tápellátás & GND
 Közös GND a relékkel és a mikrokontrollerrel
+
+Hozzávalók - XPS lapok, hullámpala, ragasztó
 <img width="864" height="1184" alt="Gemini_Generated_Image_px4bobpx4bobpx4b" src="https://github.com/user-attachments/assets/c6e7ee19-c22f-4fa6-9cc8-87337ee0a540" />
