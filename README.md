@@ -1,4 +1,6 @@
 <img width="1536" height="1024" alt="ChatGPT Image 2025  okt  24  00_03_55" src="https://github.com/user-attachments/assets/d21d9aed-7023-44c4-a628-8dffebe2a87b" />
+<img width="1289" height="768" alt="image" src="https://github.com/user-attachments/assets/5052bebf-a475-41b0-ab57-48fe65c8fd59" />
+
 CHILI NEVELDE 1.0 — TELJES DOKUMENTÁCIÓ & ÚTMUTATÓ
 ESP8266 Bekötési Rajz, Festési Útmutató, C++ Forráskód & Működési Elv
 
